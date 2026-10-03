@@ -53,6 +53,17 @@ def get_jules_headers() -> Dict[str, str]:
     }
 
 
+
+def is_session_existing_in_discord(guild: discord.Guild, session_id: str) -> bool:
+    for ch in guild.channels:
+        if isinstance(ch, discord.TextChannel) and ch.topic and f"session:{session_id}" in ch.topic:
+            return True
+        if hasattr(ch, "threads"):
+            for th in ch.threads:
+                if th.id in active_conversations and active_conversations[th.id].get("session_id") == session_id:
+                    return True
+    return False
+
 def slugify(title: str, max_len: int = 25) -> str:
     clean = re.sub(r"[^a-zA-Z0-9\s-]", "", title).strip().lower()
     slug = re.sub(r"[\s-]+", "-", clean)[:max_len].strip("-")
@@ -353,7 +364,7 @@ async def auto_sync_loop():
                             sid = s.get("id") or s.get("name", "").split("/")[-1]
                             title = s.get("title") or s.get("prompt", f"Session {sid}")[:40]
 
-                            if sid in tracked_session_ids:
+                            if is_session_existing_in_discord(guild, sid):
                                 continue
 
                             await create_conversation_target(guild, sid, title, s.get("prompt", ""))
@@ -429,7 +440,7 @@ async def sync_jules_sessions(ctx: commands.Context):
                 sid = s.get("id") or s.get("name", "").split("/")[-1]
                 title = s.get("title") or s.get("prompt", f"Session {sid}")[:40]
 
-                if sid in tracked_session_ids:
+                if is_session_existing_in_discord(ctx.guild, sid):
                     continue
 
                 await create_conversation_target(ctx.guild, sid, title, s.get("prompt", ""))
