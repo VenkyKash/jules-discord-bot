@@ -161,9 +161,70 @@ async def poll_session_activities(session_id: str, thread: discord.Thread):
                     logger.error(f"Polling error for session {session_id}: {e}")
 
 
+
+async def auto_sync_loop():
+    """Background task that runs every 30 seconds to automatically discover new sessions started anywhere."""
+    await bot.wait_until_ready()
+    logger.info("Auto-sync loop started.")
+
+    while not bot.is_closed():
+        try:
+            # Pick the first available text channel the bot can speak in
+            target_channel = None
+            for guild in bot.guilds:
+                for channel in guild.text_channels:
+                    if channel.permissions_for(guild.me).send_messages and channel.permissions_for(guild.me).create_public_threads:
+                        target_channel = channel
+                        break
+                if target_channel:
+                    break
+
+            if target_channel:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.get(f"{JULES_API_BASE}/sessions?pageSize=10", headers=get_jules_headers())
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        sessions = data.get("sessions", [])
+                        for s in sessions:
+                            sid = s.get("id") or s.get("name", "").split("/")[-1]
+                            title = s.get("title") or s.get("prompt", f"Session {sid}")[:40]
+
+                            already_tracked = any(v.get("session_id") == sid for v in active_sessions.values())
+                            if already_tracked:
+                                continue
+
+                            # Auto-create thread in target channel
+                            thread_msg = await target_channel.send(f"🔔 **Detected New Jules Session:** `{sid}`\n**Title/Prompt:** {title}")
+                            thread = await thread_msg.create_thread(
+                                name=f"Jules: {title[:35]}",
+                                auto_archive_duration=1440,
+                            )
+
+                            active_sessions[thread.id] = {
+                                "session_id": sid,
+                                "prompt": s.get("prompt", ""),
+                            }
+
+                            await thread.send(
+                                f"**Auto-attached to Jules Session:** `{sid}`\n"
+                                f"**Prompt:** {s.get('prompt', 'N/A')}\n"
+                                f"Streaming updates for this session now. You can reply in this thread to talk to Jules!"
+                            )
+
+                            bot.loop.create_task(poll_session_activities(sid, thread))
+                            logger.info(f"Auto-synced new session {sid} into thread {thread.id}")
+        except Exception as e:
+            logger.debug(f"Auto-sync loop check error: {e}")
+
+        await asyncio.sleep(20)
+
+
 @bot.event
 async def on_ready():
     logger.info(f"Jules Discord Bot logged in as {bot.user} (ID: {bot.user.id})")
+    if not hasattr(bot, "_autosync_started"):
+        bot._autosync_started = True
+        bot.loop.create_task(auto_sync_loop())
 
 
 @bot.command(name="jules")
