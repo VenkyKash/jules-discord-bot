@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import sys
 import logging
 from typing import Dict, Any, Optional
@@ -254,7 +256,28 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'OK')
+
+    def log_message(self, format, *args):
+        # Silence HTTP access logs
+        return
+
+def run_health_server():
+    port = int(os.getenv('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logger.info(f'Health check web server running on port {port}')
+    server.serve_forever()
+
 def main():
+    # Start health check server in background thread for Render Web Service
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     if not DISCORD_BOT_TOKEN:
         print("ERROR: DISCORD_BOT_TOKEN environment variable not set.", file=sys.stderr)
         sys.exit(1)
