@@ -3,20 +3,20 @@
 Jules Discord Bot Bridge
 ------------------------
 Enables interactive 2-way chat with Google Jules from Discord.
-Runs continuously on Render (or local Mac) independent of Jules' ephemeral VMs.
+Runs continuously on Render with channel / thread management.
 """
 
 from __future__ import annotations
 
 import asyncio
 import datetime
+import logging
 import os
 import re
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import sys
-import logging
-from typing import Dict, Any, Optional
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any, Dict, Optional
 
 import discord
 from discord.ext import commands
@@ -31,26 +31,16 @@ GITHUB_REPO = os.getenv("GITHUB_REPO", "VenkyKash/jev-use-exp")
 DEFAULT_BRANCH = os.getenv("DEFAULT_BRANCH", "jules")
 CATEGORY_NAME = os.getenv("CATEGORY_NAME", "🤖 JULES SESSIONS")
 
-def slugify(title: str, max_len: int = 25) -> str:
-    clean = re.sub(r"[^a-zA-Z0-9\s-]", "", title).strip().lower()
-    slug = re.sub(r"[\s-]+", "-", clean)[:max_len].strip("-")
-    return slug or "session"
-
-async def get_or_create_category(guild: discord.Guild) -> discord.CategoryChannel:
-    for cat in guild.categories:
-        if cat.name.lower() == CATEGORY_NAME.lower():
-            return cat
-    return await guild.create_category(name=CATEGORY_NAME)
-
-
 JULES_API_BASE = "https://jules.googleapis.com/v1alpha"
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Track active sessions mapped to discord thread IDs: thread_id -> session_dict
-active_sessions: Dict[int, Dict[str, Any]] = {}
+# Track active sessions: channel_or_thread_id -> session_dict
+active_conversations: Dict[int, Dict[str, Any]] = {}
+tracked_session_ids: set[str] = set()
 
 
 def get_jules_headers() -> Dict[str, str]:
@@ -59,12 +49,30 @@ def get_jules_headers() -> Dict[str, str]:
     return {
         "x-goog-api-key": JULES_API_KEY,
         "Content-Type": "application/json",
-        "User-Agent": "Jules-Discord-Bot/1.0",
+        "User-Agent": "Jules-Discord-Bot/3.0",
     }
 
 
+def slugify(title: str, max_len: int = 25) -> str:
+    clean = re.sub(r"[^a-zA-Z0-9\s-]", "", title).strip().lower()
+    slug = re.sub(r"[\s-]+", "-", clean)[:max_len].strip("-")
+    return slug or "session"
+
+
+async def get_or_create_category(guild: discord.Guild) -> Optional[discord.CategoryChannel]:
+    """Finds or creates category if bot has manage_channels permission."""
+    try:
+        for cat in guild.categories:
+            if cat.name.lower() == CATEGORY_NAME.lower():
+                return cat
+        if guild.me.guild_permissions.manage_channels:
+            return await guild.create_category(name=CATEGORY_NAME)
+    except Exception as e:
+        logger.warning(f"Could not create category '{CATEGORY_NAME}': {e}")
+    return None
+
+
 async def resolve_source_name(client: httpx.AsyncClient) -> str:
-    """Finds the source name for the configured repo from Jules API."""
     url = f"{JULES_API_BASE}/sources"
     resp = await client.get(url, headers=get_jules_headers())
     resp.raise_for_status()
@@ -75,21 +83,21 @@ async def resolve_source_name(client: httpx.AsyncClient) -> str:
             return src.get("name")
         if src.get("id", "").lower().endswith(GITHUB_REPO.lower()):
             return src.get("name")
-    # Default fallback construct
     return f"sources/github/{GITHUB_REPO}"
 
 
 class PlanApprovalView(discord.ui.View):
-    def __init__(self, session_id: str, thread: discord.Thread):
+    def __init__(self, session_id: str, target: discord.abc.Messageable):
         super().__init__(timeout=None)
         self.session_id = session_id
-        self.thread = thread
+        self.target = target
 
     @discord.ui.button(label="Approve Plan & Run", style=discord.ButtonStyle.green, emoji="✅")
     async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         button.disabled = True
         button.label = "Plan Approved"
+        button.style = discord.ButtonStyle.secondary
         await interaction.message.edit(view=self)
 
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -97,59 +105,78 @@ class PlanApprovalView(discord.ui.View):
             try:
                 resp = await client.post(url, headers=get_jules_headers())
                 resp.raise_for_status()
-                await self.thread.send(" Plan approved! Jules is starting execution...")
+                embed = discord.Embed(
+                    title="Plan Approved",
+                    description="Jules has been authorized and is now executing the plan.",
+                    color=0x2ECC71,
+                )
+                await self.target.send(embed=embed)
             except Exception as e:
                 logger.exception("Failed to approve plan")
-                await self.thread.send(f"⚠️ Failed to approve plan: `{e}`")
+                await self.target.send(f"⚠️ Failed to approve plan: `{e}`")
 
 
-async def poll_session_activities(session_id: str, thread: discord.Thread, prompt: str = ""):
+async def poll_session_activities(session_id: str, target: discord.abc.Messageable, prompt: str = ""):
+    """Polls Jules session and populates target channel/thread with live updates."""
+    seen_activity_ids = set()
+    consecutive_errors = 0
+    last_progress_text = ""
+
     status_embed = discord.Embed(
-        title="🤖 Jules Agent Status",
+        title="🤖 Jules Session Status",
         description="Initializing container environment...",
         color=0x3498DB,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )
     status_embed.add_field(name="Session ID", value=f"`{session_id}`", inline=True)
     status_embed.add_field(name="Status", value="⚙️ Starting", inline=True)
+    status_embed.add_field(name="Branch", value=f"`{DEFAULT_BRANCH}`", inline=True)
     if prompt:
-        status_embed.add_field(name="Task", value=f"_{prompt[:200]}_", inline=False)
-    status_embed.set_footer(text="Updates in-place • Google Jules")
+        status_embed.add_field(name="Task Prompt", value=f"_{prompt[:300]}_", inline=False)
+    status_embed.set_footer(text="Live status card • Google Jules")
 
-    status_card = None
+    status_card: Optional[discord.Message] = None
     try:
-        status_card = await thread.send(embed=status_embed)
+        status_card = await target.send(embed=status_embed)
+        if isinstance(target, discord.TextChannel):
+            try:
+                await status_card.pin()
+            except Exception:
+                pass
     except Exception as e:
-        logger.warning(f"Could not post initial card: {e}")
-
-    last_progress_text = "" 
-    """Background task polling Jules activities for progress updates."""
-    seen_activity_ids = set()
-    consecutive_errors = 0
+        logger.warning(f"Could not post initial status card: {e}")
 
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(6)
         async with httpx.AsyncClient(timeout=30.0) as client:
             try:
-                # 1. Check session status
                 session_url = f"{JULES_API_BASE}/sessions/{session_id}"
                 session_resp = await client.get(session_url, headers=get_jules_headers())
                 if session_resp.status_code == 200:
                     sdata = session_resp.json()
-                    # Check if PR created
                     for out in sdata.get("outputs", []):
                         pr = out.get("pullRequest")
                         if pr and pr.get("url") not in seen_activity_ids:
                             seen_activity_ids.add(pr.get("url"))
-                            await thread.send(
-                                f"🎉 **Jules created a Pull Request!**\n"
-                                f"**Title:** {pr.get('title')}\n"
-                                f"**Link:** {pr.get('url')}\n"
-                                f"_{pr.get('description', '')[:300]}_"
+                            pr_embed = discord.Embed(
+                                title="🎉 Pull Request Ready!",
+                                url=pr.get("url"),
+                                description=f"**{pr.get('title')}**\n\n{pr.get('description', '')[:600]}",
+                                color=0x2ECC71,
+                                timestamp=datetime.datetime.now(datetime.timezone.utc),
                             )
+                            pr_embed.add_field(name="GitHub URL", value=f"[Open Pull Request]({pr.get('url')})", inline=False)
+                            await target.send(embed=pr_embed)
 
-                # 2. Check activities stream
-                act_url = f"{JULES_API_BASE}/sessions/{session_id}/activities?pageSize=15"
+                            if status_card:
+                                status_embed.color = 0x2ECC71
+                                status_embed.set_field_at(1, name="Status", value="🟢 PR Created", inline=True)
+                                try:
+                                    await status_card.edit(embed=status_embed)
+                                except Exception:
+                                    pass
+
+                act_url = f"{JULES_API_BASE}/sessions/{session_id}/activities?pageSize=20"
                 act_resp = await client.get(act_url, headers=get_jules_headers())
                 if act_resp.status_code == 200:
                     adata = act_resp.json()
@@ -159,26 +186,15 @@ async def poll_session_activities(session_id: str, thread: discord.Thread, promp
                             continue
                         seen_activity_ids.add(aid)
 
-                        # 1. Plan Generated
-                        if "planGenerated" in act:
-                            plan_data = act["planGenerated"].get("plan", {})
-                            steps = plan_data.get("steps", [])
-                            steps_str = "\n".join([f"{s.get('index', i)+1}. **{s.get('title')}**: {s.get('description')}" for i, s in enumerate(steps)])
-                            view = PlanApprovalView(session_id, thread)
-                            await thread.send(
-                                f"📋 **Jules generated a Plan:**\n{steps_str[:1800]}",
-                                view=view,
-                            )
-                        # 1. User Messaged (From Web UI or API)
-                        elif "userMessaged" in act:
+                        if "userMessaged" in act:
                             u_msg = act["userMessaged"].get("userMessage", "")
                             if u_msg:
                                 u_embed = discord.Embed(
                                     description=f"💬 **User:** {u_msg[:1900]}",
                                     color=0x95A5A6,
                                 )
-                                await thread.send(embed=u_embed)
-                        # 2. Agent Messaged (Jules speaking)
+                                await target.send(embed=u_embed)
+
                         elif "agentMessaged" in act:
                             msg = act["agentMessaged"].get("agentMessage", "")
                             if msg:
@@ -187,8 +203,33 @@ async def poll_session_activities(session_id: str, thread: discord.Thread, promp
                                     description=msg[:1900],
                                     color=0x9B59B6,
                                 )
-                                await thread.send(embed=a_embed)
-                        # 3. Progress Updated (In-place edit)
+                                await target.send(embed=a_embed)
+
+                        elif "planGenerated" in act:
+                            plan_data = act["planGenerated"].get("plan", {})
+                            steps = plan_data.get("steps", [])
+                            steps_lines = []
+                            for i, s in enumerate(steps):
+                                idx = s.get("index", i) + 1
+                                steps_lines.append(f"**{idx}. {s.get('title')}**\n_{s.get('description', '')}_")
+
+                            plan_embed = discord.Embed(
+                                title="📋 Proposed Plan",
+                                description="\n\n".join(steps_lines)[:3800] or "No step details provided.",
+                                color=0xF1C40F,
+                            )
+                            plan_embed.set_footer(text="Click below to approve and run")
+                            view = PlanApprovalView(session_id, target)
+                            await target.send(embed=plan_embed, view=view)
+
+                            if status_card:
+                                status_embed.color = 0xF1C40F
+                                status_embed.set_field_at(1, name="Status", value="🟡 Awaiting Plan Approval", inline=True)
+                                try:
+                                    await status_card.edit(embed=status_embed)
+                                except Exception:
+                                    pass
+
                         elif "progressUpdated" in act:
                             p = act["progressUpdated"]
                             title_step = p.get("title", "")
@@ -205,7 +246,7 @@ async def poll_session_activities(session_id: str, thread: discord.Thread, promp
                                         await status_card.edit(embed=status_embed)
                                     except Exception:
                                         pass
-                        # 4. Session Completed
+
                         elif "sessionCompleted" in act:
                             if status_card:
                                 status_embed.description = " Task completed successfully!"
@@ -215,41 +256,96 @@ async def poll_session_activities(session_id: str, thread: discord.Thread, promp
                                     await status_card.edit(embed=status_embed)
                                 except Exception:
                                     pass
-                            break
-                        # 5. Session Failed
+                            return
+
                         elif "sessionFailed" in act:
                             reason = act["sessionFailed"].get("reason", "Unknown error")
-                            await thread.send(f"❌ **Session failed:** {reason}")
-                            break
+                            fail_embed = discord.Embed(
+                                title="❌ Session Failed",
+                                description=f"```{reason[:1800]}```",
+                                color=0xE74C3C,
+                            )
+                            await target.send(embed=fail_embed)
+                            if status_card:
+                                status_embed.description = f"❌ Execution failed: {reason}"
+                                status_embed.color = 0xE74C3C
+                                status_embed.set_field_at(1, name="Status", value="🔴 Failed", inline=True)
+                                try:
+                                    await status_card.edit(embed=status_embed)
+                                except Exception:
+                                    pass
+                            return
 
                 consecutive_errors = 0
             except Exception as e:
                 consecutive_errors += 1
-                if consecutive_errors > 5:
+                if consecutive_errors > 8:
                     logger.error(f"Polling error for session {session_id}: {e}")
 
 
+async def create_conversation_target(guild: discord.Guild, session_id: str, title: str, prompt: str = ""):
+    """Tries to create a dedicated channel, falls back gracefully to a thread if permissions are missing."""
+    target_channel = None
+    for ch in guild.text_channels:
+        if ch.permissions_for(guild.me).send_messages:
+            target_channel = ch
+            break
+
+    if not target_channel:
+        logger.warning(f"No writable text channel found in guild {guild.name}")
+        return
+
+    # 1. Try creating a dedicated channel if bot has manage_channels permission
+    if guild.me.guild_permissions.manage_channels:
+        try:
+            category = await get_or_create_category(guild)
+            ch_slug = f"jules-{slugify(title)}"
+            channel = await guild.create_text_channel(
+                name=ch_slug,
+                category=category,
+                topic=f"Jules Task Session | session:{session_id} | Repo: {GITHUB_REPO}",
+            )
+            active_conversations[channel.id] = {"session_id": session_id, "prompt": prompt or title}
+            tracked_session_ids.add(session_id)
+            bot.loop.create_task(poll_session_activities(session_id, channel, prompt or title))
+            logger.info(f"Created dedicated channel #{channel.name} for session {session_id}")
+            return
+        except Exception as e:
+            logger.warning(f"Failed to create dedicated channel, falling back to thread: {e}")
+
+    # 2. Fallback: Create a Discord Thread in target_channel
+    try:
+        announce_embed = discord.Embed(
+            title="🔔 Jules Session Detected",
+            description=f"**{title}**",
+            color=0x3498DB,
+        )
+        announce_embed.add_field(name="Session ID", value=f"`{session_id}`", inline=True)
+        announce_embed.add_field(name="Branch", value=f"`{DEFAULT_BRANCH}`", inline=True)
+
+        msg = await target_channel.send(embed=announce_embed)
+        thread = await msg.create_thread(
+            name=f"Jules: {title[:32]}",
+            auto_archive_duration=1440,
+        )
+        active_conversations[thread.id] = {"session_id": session_id, "prompt": prompt or title}
+        tracked_session_ids.add(session_id)
+        bot.loop.create_task(poll_session_activities(session_id, thread, prompt or title))
+        logger.info(f"Created thread #{thread.name} for session {session_id}")
+    except Exception as e:
+        logger.error(f"Failed to create fallback thread for session {session_id}: {e}")
+
 
 async def auto_sync_loop():
-    """Background task that runs every 30 seconds to automatically discover new sessions started anywhere."""
+    """Continuously checks Jules API and attaches to any new sessions."""
     await bot.wait_until_ready()
-    logger.info("Auto-sync loop started.")
+    logger.info("Auto-sync loop running.")
 
     while not bot.is_closed():
         try:
-            # Pick the first available text channel the bot can speak in
-            target_channel = None
             for guild in bot.guilds:
-                for channel in guild.text_channels:
-                    if channel.permissions_for(guild.me).send_messages and channel.permissions_for(guild.me).create_public_threads:
-                        target_channel = channel
-                        break
-                if target_channel:
-                    break
-
-            if target_channel:
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    resp = await client.get(f"{JULES_API_BASE}/sessions?pageSize=10", headers=get_jules_headers())
+                    resp = await client.get(f"{JULES_API_BASE}/sessions?pageSize=15", headers=get_jules_headers())
                     if resp.status_code == 200:
                         data = resp.json()
                         sessions = data.get("sessions", [])
@@ -257,39 +353,12 @@ async def auto_sync_loop():
                             sid = s.get("id") or s.get("name", "").split("/")[-1]
                             title = s.get("title") or s.get("prompt", f"Session {sid}")[:40]
 
-                            already_tracked = any(v.get("session_id") == sid for v in active_sessions.values())
-                            if already_tracked:
+                            if sid in tracked_session_ids:
                                 continue
 
-                            # Create clean announcement embed in channel
-                            announce_embed = discord.Embed(
-                                title="🔔 Detected Jules Session",
-                                description=f"**{title}**",
-                                color=0x3498DB,
-                            )
-                            announce_embed.add_field(name="Session ID", value=f"`{sid}`", inline=True)
-                            announce_embed.add_field(name="Branch", value=f"`{DEFAULT_BRANCH}`", inline=True)
-
-                            category = await get_or_create_category(target_channel.guild)
-                            ch_slug = f"jules-{slugify(title)}"
-                            channel = await target_channel.guild.create_text_channel(
-                                name=ch_slug,
-                                category=category,
-                                topic=f"Jules Task Session | session:{sid} | Repo: {GITHUB_REPO}",
-                            )
-
-                            active_sessions[channel.id] = {
-                                "session_id": sid,
-                                "prompt": s.get("prompt", ""),
-                            }
-
-                            announce_embed.description = f"**{title}**\n\n➡️ Dedicated channel: {channel.mention}"
-                            await target_channel.send(embed=announce_embed)
-
-                            bot.loop.create_task(poll_session_activities(sid, channel, s.get("prompt", "")))
-                            logger.info(f"Auto-synced new session {sid} into thread {thread.id}")
+                            await create_conversation_target(guild, sid, title, s.get("prompt", ""))
         except Exception as e:
-            logger.debug(f"Auto-sync loop check error: {e}")
+            logger.warning(f"Auto-sync loop error: {e}")
 
         await asyncio.sleep(20)
 
@@ -336,101 +405,56 @@ async def start_jules_task(ctx: commands.Context, *, prompt: str):
             sdata = resp.json()
             session_id = sdata.get("id") or sdata.get("name", "").split("/")[-1]
 
-            # Create a dedicated Discord Thread for this session
-            thread = await ctx.message.create_thread(
-                name=f"Jules: {prompt[:40]}",
-                auto_archive_duration=1440,
-            )
-
-            active_sessions[thread.id] = {
-                "session_id": session_id,
-                "prompt": prompt,
-            }
-
-            await status_msg.edit(content=f" Session `{session_id}` started! Follow along in {thread.mention}.")
-            await thread.send(
-                f"**Task Prompt:** {prompt}\n"
-                f"**Repo:** `{GITHUB_REPO}` (Branch: `{DEFAULT_BRANCH}`)\n"
-                f"Any message you reply inside this thread will be sent directly to Jules!"
-            )
-
-            # Start background poller
-            bot.loop.create_task(poll_session_activities(session_id, thread))
+            await create_conversation_target(ctx.guild, session_id, prompt[:30], prompt)
+            await status_msg.edit(content=f" Session `{session_id}` started and synced to your Discord server!")
 
         except Exception as e:
             logger.exception("Failed to start Jules session")
             await status_msg.edit(content=f"❌ Failed to start Jules session: `{e}`")
 
 
-
 @bot.command(name="sync")
 async def sync_jules_sessions(ctx: commands.Context):
-    """Syncs active or recent Jules sessions from the web UI into Discord threads."""
-    status_msg = await ctx.reply("🔍 Checking Jules API for active sessions on repo...")
-
+    """Manually triggers a sync scan of Jules sessions."""
+    status_msg = await ctx.reply("🔍 Scanning Jules API for sessions...")
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            resp = await client.get(f"{JULES_API_BASE}/sessions?pageSize=10", headers=get_jules_headers())
+            resp = await client.get(f"{JULES_API_BASE}/sessions?pageSize=15", headers=get_jules_headers())
             resp.raise_for_status()
             data = resp.json()
             sessions = data.get("sessions", [])
-
-            if not sessions:
-                await status_msg.edit(content="ℹ️ No sessions found on Jules for this account/repo.")
-                return
 
             synced_count = 0
             for s in sessions:
                 sid = s.get("id") or s.get("name", "").split("/")[-1]
                 title = s.get("title") or s.get("prompt", f"Session {sid}")[:40]
 
-                # Check if already tracked
-                already_tracked = any(v.get("session_id") == sid for v in active_sessions.values())
-                if already_tracked:
+                if sid in tracked_session_ids:
                     continue
 
-                thread_msg = await ctx.send(f"📌 **Found Jules Session:** `{sid}`\n**Title/Prompt:** {title}")
-                thread = await thread_msg.create_thread(
-                    name=f"Jules: {title[:35]}",
-                    auto_archive_duration=1440,
-                )
-
-                active_sessions[thread.id] = {
-                    "session_id": sid,
-                    "prompt": s.get("prompt", ""),
-                }
-
-                await thread.send(
-                    f"**Linked to Jules Session:** `{sid}`\n"
-                    f"**Prompt:** {s.get('prompt', 'N/A')}\n"
-                    f"Streaming updates for this session now. You can reply in this thread to talk to Jules!"
-                )
-
-                bot.loop.create_task(poll_session_activities(sid, thread))
+                await create_conversation_target(ctx.guild, sid, title, s.get("prompt", ""))
                 synced_count += 1
 
             if synced_count > 0:
-                await status_msg.edit(content=f" Synced {synced_count} Jules session(s) into Discord threads!")
+                await status_msg.edit(content=f" Synced {synced_count} Jules session(s)!")
             else:
-                await status_msg.edit(content=" All existing sessions are already tracked in Discord.")
+                await status_msg.edit(content=" All sessions are already tracked.")
 
         except Exception as e:
             logger.exception("Failed to sync sessions")
-            await status_msg.edit(content=f"❌ Error syncing sessions from Jules: `{e}`")
+            await status_msg.edit(content=f"❌ Error syncing sessions: `{e}`")
 
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore bot messages
     if message.author.bot:
         return
 
-    # Check if this message is inside a registered Jules task thread
-    if message.channel.id in active_sessions:
-        session_info = active_sessions[message.channel.id]
+    # Two-way forwarding: works for both dedicated text channels and threads
+    if message.channel.id in active_conversations:
+        session_info = active_conversations[message.channel.id]
         session_id = session_info["session_id"]
 
-        # Forward user message to Jules
         async with httpx.AsyncClient(timeout=30.0) as client:
             try:
                 url = f"{JULES_API_BASE}/sessions/{session_id}:sendMessage"
@@ -449,26 +473,25 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
-
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
+        self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b'OK')
+        self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        # Silence HTTP access logs
         return
 
+
 def run_health_server():
-    port = int(os.getenv('PORT', 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    logger.info(f'Health check web server running on port {port}')
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"Health check web server running on port {port}")
     server.serve_forever()
 
+
 def main():
-    # Start health check server in background thread for Render Web Service
     threading.Thread(target=run_health_server, daemon=True).start()
 
     if not DISCORD_BOT_TOKEN:
