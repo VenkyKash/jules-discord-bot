@@ -390,6 +390,20 @@ async def auto_sync_loop():
 @bot.event
 async def on_ready():
     logger.info(f"Jules Discord Bot logged in as {bot.user} (ID: {bot.user.id})")
+    
+    # Re-attach to existing channels after restart
+    for guild in bot.guilds:
+        for ch in guild.channels:
+            if isinstance(ch, discord.TextChannel) and ch.topic and "session:" in ch.topic:
+                m = re.search(r"session:([^\s|]+)", ch.topic)
+                if m:
+                    sid = m.group(1)
+                    if sid not in tracked_session_ids:
+                        active_conversations[ch.id] = {"session_id": sid, "prompt": "Resumed Session"}
+                        tracked_session_ids.add(sid)
+                        bot.loop.create_task(poll_session_activities(sid, ch, "Resumed Session"))
+                        logger.info(f"Resumed tracking session {sid} on channel #{ch.name}")
+
     if not hasattr(bot, "_autosync_started"):
         bot._autosync_started = True
         bot.loop.create_task(auto_sync_loop())
