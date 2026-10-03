@@ -123,19 +123,34 @@ async def poll_session_activities(session_id: str, thread: discord.Thread):
                             continue
                         seen_activity_ids.add(aid)
 
-                        # Check for plan generation
-                        if "plan" in act:
-                            plan_text = act["plan"].get("description") or str(act["plan"])
+                        # 1. Plan Generated
+                        if "planGenerated" in act:
+                            plan_data = act["planGenerated"].get("plan", {})
+                            steps = plan_data.get("steps", [])
+                            steps_str = "\n".join([f"{s.get('index', i)+1}. **{s.get('title')}**: {s.get('description')}" for i, s in enumerate(steps)])
                             view = PlanApprovalView(session_id, thread)
                             await thread.send(
-                                f"📋 **Jules generated a Plan:**\n```markdown\n{plan_text[:1800]}\n```",
+                                f"📋 **Jules generated a Plan:**\n{steps_str[:1800]}",
                                 view=view,
                             )
-                        # Check for messages/progress from agent
-                        elif act.get("originator") == "AGENT" and "message" in act:
-                            msg = act["message"].get("text", "")
+                        # 2. Agent Messaged
+                        elif "agentMessaged" in act:
+                            msg = act["agentMessaged"].get("agentMessage", "")
                             if msg:
                                 await thread.send(f"🤖 **Jules:** {msg[:1900]}")
+                        # 3. Progress Updated
+                        elif "progressUpdated" in act:
+                            p = act["progressUpdated"]
+                            await thread.send(f"⏳ **Progress:** {p.get('title', '')} - _{p.get('description', '')}_")
+                        # 4. Session Completed
+                        elif "sessionCompleted" in act:
+                            await thread.send("🏁 **Session completed successfully!**")
+                            break
+                        # 5. Session Failed
+                        elif "sessionFailed" in act:
+                            reason = act["sessionFailed"].get("reason", "Unknown error")
+                            await thread.send(f"❌ **Session failed:** {reason}")
+                            break
 
                 consecutive_errors = 0
             except Exception as e:
