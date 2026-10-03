@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import os
+import re
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import sys
@@ -28,6 +29,19 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 JULES_API_KEY = os.getenv("JULES_API_KEY")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "VenkyKash/jev-use-exp")
 DEFAULT_BRANCH = os.getenv("DEFAULT_BRANCH", "jules")
+CATEGORY_NAME = os.getenv("CATEGORY_NAME", "🤖 JULES SESSIONS")
+
+def slugify(title: str, max_len: int = 25) -> str:
+    clean = re.sub(r"[^a-zA-Z0-9\s-]", "", title).strip().lower()
+    slug = re.sub(r"[\s-]+", "-", clean)[:max_len].strip("-")
+    return slug or "session"
+
+async def get_or_create_category(guild: discord.Guild) -> discord.CategoryChannel:
+    for cat in guild.categories:
+        if cat.name.lower() == CATEGORY_NAME.lower():
+            return cat
+    return await guild.create_category(name=CATEGORY_NAME)
+
 
 JULES_API_BASE = "https://jules.googleapis.com/v1alpha"
 
@@ -155,11 +169,25 @@ async def poll_session_activities(session_id: str, thread: discord.Thread, promp
                                 f"📋 **Jules generated a Plan:**\n{steps_str[:1800]}",
                                 view=view,
                             )
-                        # 2. Agent Messaged
+                        # 1. User Messaged (From Web UI or API)
+                        elif "userMessaged" in act:
+                            u_msg = act["userMessaged"].get("userMessage", "")
+                            if u_msg:
+                                u_embed = discord.Embed(
+                                    description=f"💬 **User:** {u_msg[:1900]}",
+                                    color=0x95A5A6,
+                                )
+                                await thread.send(embed=u_embed)
+                        # 2. Agent Messaged (Jules speaking)
                         elif "agentMessaged" in act:
                             msg = act["agentMessaged"].get("agentMessage", "")
                             if msg:
-                                await thread.send(f"🤖 **Jules:** {msg[:1900]}")
+                                a_embed = discord.Embed(
+                                    title="🤖 Jules",
+                                    description=msg[:1900],
+                                    color=0x9B59B6,
+                                )
+                                await thread.send(embed=a_embed)
                         # 3. Progress Updated (In-place edit)
                         elif "progressUpdated" in act:
                             p = act["progressUpdated"]
@@ -242,18 +270,23 @@ async def auto_sync_loop():
                             announce_embed.add_field(name="Session ID", value=f"`{sid}`", inline=True)
                             announce_embed.add_field(name="Branch", value=f"`{DEFAULT_BRANCH}`", inline=True)
 
-                            thread_msg = await target_channel.send(embed=announce_embed)
-                            thread = await thread_msg.create_thread(
-                                name=f"Jules: {title[:32]}",
-                                auto_archive_duration=1440,
+                            category = await get_or_create_category(target_channel.guild)
+                            ch_slug = f"jules-{slugify(title)}"
+                            channel = await target_channel.guild.create_text_channel(
+                                name=ch_slug,
+                                category=category,
+                                topic=f"Jules Task Session | session:{sid} | Repo: {GITHUB_REPO}",
                             )
 
-                            active_sessions[thread.id] = {
+                            active_sessions[channel.id] = {
                                 "session_id": sid,
                                 "prompt": s.get("prompt", ""),
                             }
 
-                            bot.loop.create_task(poll_session_activities(sid, thread, s.get("prompt", "")))
+                            announce_embed.description = f"**{title}**\n\n➡️ Dedicated channel: {channel.mention}"
+                            await target_channel.send(embed=announce_embed)
+
+                            bot.loop.create_task(poll_session_activities(sid, channel, s.get("prompt", "")))
                             logger.info(f"Auto-synced new session {sid} into thread {thread.id}")
         except Exception as e:
             logger.debug(f"Auto-sync loop check error: {e}")
@@ -393,7 +426,7 @@ async def on_message(message: discord.Message):
         return
 
     # Check if this message is inside a registered Jules task thread
-    if isinstance(message.channel, discord.Thread) and message.channel.id in active_sessions:
+    if message.channel.id in active_sessions:
         session_info = active_sessions[message.channel.id]
         session_id = session_info["session_id"]
 
