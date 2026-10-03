@@ -187,11 +187,24 @@ async def poll_session_activities(session_id: str, target: discord.abc.Messageab
                                 except Exception:
                                     pass
 
-                act_url = f"{JULES_API_BASE}/sessions/{session_id}/activities?pageSize=20"
+                act_url = f"{JULES_API_BASE}/sessions/{session_id}/activities?pageSize=50"
                 act_resp = await client.get(act_url, headers=get_jules_headers())
                 if act_resp.status_code == 200:
                     adata = act_resp.json()
-                    for act in adata.get("activities", []):
+                    
+                    activities = adata.get("activities", [])
+                    page_token = adata.get("nextPageToken")
+                    
+                    while page_token:
+                        next_url = f"{JULES_API_BASE}/sessions/{session_id}/activities?pageSize=50&pageToken={page_token}"
+                        next_resp = await client.get(next_url, headers=get_jules_headers())
+                        if next_resp.status_code != 200:
+                            break
+                        next_data = next_resp.json()
+                        activities.extend(next_data.get("activities", []))
+                        page_token = next_data.get("nextPageToken")
+
+                    for act in activities:
                         aid = act.get("id") or act.get("name")
                         if aid in seen_activity_ids:
                             continue
