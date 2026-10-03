@@ -226,6 +226,63 @@ async def start_jules_task(ctx: commands.Context, *, prompt: str):
             await status_msg.edit(content=f"❌ Failed to start Jules session: `{e}`")
 
 
+
+@bot.command(name="sync")
+async def sync_jules_sessions(ctx: commands.Context):
+    """Syncs active or recent Jules sessions from the web UI into Discord threads."""
+    status_msg = await ctx.reply("🔍 Checking Jules API for active sessions on repo...")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.get(f"{JULES_API_BASE}/sessions?pageSize=10", headers=get_jules_headers())
+            resp.raise_for_status()
+            data = resp.json()
+            sessions = data.get("sessions", [])
+
+            if not sessions:
+                await status_msg.edit(content="ℹ️ No sessions found on Jules for this account/repo.")
+                return
+
+            synced_count = 0
+            for s in sessions:
+                sid = s.get("id") or s.get("name", "").split("/")[-1]
+                title = s.get("title") or s.get("prompt", f"Session {sid}")[:40]
+
+                # Check if already tracked
+                already_tracked = any(v.get("session_id") == sid for v in active_sessions.values())
+                if already_tracked:
+                    continue
+
+                thread_msg = await ctx.send(f"📌 **Found Jules Session:** `{sid}`\n**Title/Prompt:** {title}")
+                thread = await thread_msg.create_thread(
+                    name=f"Jules: {title[:35]}",
+                    auto_archive_duration=1440,
+                )
+
+                active_sessions[thread.id] = {
+                    "session_id": sid,
+                    "prompt": s.get("prompt", ""),
+                }
+
+                await thread.send(
+                    f"**Linked to Jules Session:** `{sid}`\n"
+                    f"**Prompt:** {s.get('prompt', 'N/A')}\n"
+                    f"Streaming updates for this session now. You can reply in this thread to talk to Jules!"
+                )
+
+                bot.loop.create_task(poll_session_activities(sid, thread))
+                synced_count += 1
+
+            if synced_count > 0:
+                await status_msg.edit(content=f" Synced {synced_count} Jules session(s) into Discord threads!")
+            else:
+                await status_msg.edit(content=" All existing sessions are already tracked in Discord.")
+
+        except Exception as e:
+            logger.exception("Failed to sync sessions")
+            await status_msg.edit(content=f"❌ Error syncing sessions from Jules: `{e}`")
+
+
 @bot.event
 async def on_message(message: discord.Message):
     # Ignore bot messages
