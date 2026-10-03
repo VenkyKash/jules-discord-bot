@@ -9,6 +9,7 @@ Runs continuously on Render (or local Mac) independent of Jules' ephemeral VMs.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -88,7 +89,26 @@ class PlanApprovalView(discord.ui.View):
                 await self.thread.send(f"⚠️ Failed to approve plan: `{e}`")
 
 
-async def poll_session_activities(session_id: str, thread: discord.Thread):
+async def poll_session_activities(session_id: str, thread: discord.Thread, prompt: str = ""):
+    status_embed = discord.Embed(
+        title="🤖 Jules Agent Status",
+        description="Initializing container environment...",
+        color=0x3498DB,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    status_embed.add_field(name="Session ID", value=f"`{session_id}`", inline=True)
+    status_embed.add_field(name="Status", value="⚙️ Starting", inline=True)
+    if prompt:
+        status_embed.add_field(name="Task", value=f"_{prompt[:200]}_", inline=False)
+    status_embed.set_footer(text="Updates in-place • Google Jules")
+
+    status_card = None
+    try:
+        status_card = await thread.send(embed=status_embed)
+    except Exception as e:
+        logger.warning(f"Could not post initial card: {e}")
+
+    last_progress_text = "" 
     """Background task polling Jules activities for progress updates."""
     seen_activity_ids = set()
     consecutive_errors = 0
@@ -140,13 +160,33 @@ async def poll_session_activities(session_id: str, thread: discord.Thread):
                             msg = act["agentMessaged"].get("agentMessage", "")
                             if msg:
                                 await thread.send(f"🤖 **Jules:** {msg[:1900]}")
-                        # 3. Progress Updated
+                        # 3. Progress Updated (In-place edit)
                         elif "progressUpdated" in act:
                             p = act["progressUpdated"]
-                            await thread.send(f"⏳ **Progress:** {p.get('title', '')} - _{p.get('description', '')}_")
+                            title_step = p.get("title", "")
+                            desc_step = p.get("description", "")
+                            curr_text = f"{title_step}: {desc_step}"
+                            if curr_text != last_progress_text:
+                                last_progress_text = curr_text
+                                if status_card:
+                                    status_embed.description = f"**Current Step:** {title_step}\n_{desc_step}_"
+                                    status_embed.color = 0x3498DB
+                                    status_embed.set_field_at(1, name="Status", value="⚡ Working...", inline=True)
+                                    status_embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+                                    try:
+                                        await status_card.edit(embed=status_embed)
+                                    except Exception:
+                                        pass
                         # 4. Session Completed
                         elif "sessionCompleted" in act:
-                            await thread.send("🏁 **Session completed successfully!**")
+                            if status_card:
+                                status_embed.description = " Task completed successfully!"
+                                status_embed.color = 0x2ECC71
+                                status_embed.set_field_at(1, name="Status", value="🟢 Completed", inline=True)
+                                try:
+                                    await status_card.edit(embed=status_embed)
+                                except Exception:
+                                    pass
                             break
                         # 5. Session Failed
                         elif "sessionFailed" in act:
@@ -193,10 +233,18 @@ async def auto_sync_loop():
                             if already_tracked:
                                 continue
 
-                            # Auto-create thread in target channel
-                            thread_msg = await target_channel.send(f"🔔 **Detected New Jules Session:** `{sid}`\n**Title/Prompt:** {title}")
+                            # Create clean announcement embed in channel
+                            announce_embed = discord.Embed(
+                                title="🔔 Detected Jules Session",
+                                description=f"**{title}**",
+                                color=0x3498DB,
+                            )
+                            announce_embed.add_field(name="Session ID", value=f"`{sid}`", inline=True)
+                            announce_embed.add_field(name="Branch", value=f"`{DEFAULT_BRANCH}`", inline=True)
+
+                            thread_msg = await target_channel.send(embed=announce_embed)
                             thread = await thread_msg.create_thread(
-                                name=f"Jules: {title[:35]}",
+                                name=f"Jules: {title[:32]}",
                                 auto_archive_duration=1440,
                             )
 
@@ -205,13 +253,7 @@ async def auto_sync_loop():
                                 "prompt": s.get("prompt", ""),
                             }
 
-                            await thread.send(
-                                f"**Auto-attached to Jules Session:** `{sid}`\n"
-                                f"**Prompt:** {s.get('prompt', 'N/A')}\n"
-                                f"Streaming updates for this session now. You can reply in this thread to talk to Jules!"
-                            )
-
-                            bot.loop.create_task(poll_session_activities(sid, thread))
+                            bot.loop.create_task(poll_session_activities(sid, thread, s.get("prompt", "")))
                             logger.info(f"Auto-synced new session {sid} into thread {thread.id}")
         except Exception as e:
             logger.debug(f"Auto-sync loop check error: {e}")
