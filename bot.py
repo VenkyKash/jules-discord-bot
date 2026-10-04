@@ -204,7 +204,6 @@ async def poll_session_activities(session_id: str, target: discord.abc.Messageab
                         activities.extend(next_data.get("activities", []))
                         page_token = next_data.get("nextPageToken")
 
-                    activities.reverse()
                     for act in activities:
                         aid = act.get("id") or act.get("name")
                         if not aid:
