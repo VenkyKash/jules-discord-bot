@@ -204,8 +204,12 @@ async def poll_session_activities(session_id: str, target: discord.abc.Messageab
                         activities.extend(next_data.get("activities", []))
                         page_token = next_data.get("nextPageToken")
 
+                    activities.reverse()
                     for act in activities:
                         aid = act.get("id") or act.get("name")
+                        if not aid:
+                            aid = str(act)
+                        
                         if aid in seen_activity_ids:
                             continue
                         seen_activity_ids.add(aid)
@@ -468,6 +472,15 @@ async def sync_jules_sessions(ctx: commands.Context):
                 title = s.get("title") or s.get("prompt", f"Session {sid}")[:40]
 
                 if is_session_existing_in_discord(ctx.guild, sid):
+                    if sid not in tracked_session_ids:
+                        # Resume tracking if it exists but isn't actively polled in memory
+                        for ch in ctx.guild.channels:
+                            if isinstance(ch, discord.TextChannel) and ch.topic and f"session:{sid}" in ch.topic:
+                                active_conversations[ch.id] = {"session_id": sid, "prompt": title}
+                                tracked_session_ids.add(sid)
+                                bot.loop.create_task(poll_session_activities(sid, ch, title))
+                                synced_count += 1
+                                break
                     continue
 
                 await create_conversation_target(ctx.guild, sid, title, s.get("prompt", ""))
