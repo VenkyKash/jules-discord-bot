@@ -7,4 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 
+EXPOSE 10000
+ENV PORT=10000
+
 CMD ["python", "-u", "bot.py"]
