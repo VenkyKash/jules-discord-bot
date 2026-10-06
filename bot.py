@@ -146,29 +146,6 @@ async def poll_session_activities(session_id: str, target: discord.abc.Messageab
     last_progress_text = ""
     last_progress_title = ""
 
-    status_embed = discord.Embed(
-        title="🤖 Jules Session Status",
-        description="Initializing container environment...",
-        color=0x3498DB,
-        timestamp=datetime.datetime.now(datetime.timezone.utc),
-    )
-    status_embed.add_field(name="Session ID", value=f"`{session_id}`", inline=True)
-    status_embed.add_field(name="Status", value="⚙️ Starting", inline=True)
-    status_embed.add_field(name="Branch", value=f"`{DEFAULT_BRANCH}`", inline=True)
-    if prompt:
-        status_embed.add_field(name="Task Prompt", value=f"_{prompt[:300]}_", inline=False)
-    status_embed.set_footer(text="Live status card • Google Jules")
-
-    status_card: Optional[discord.Message] = None
-    try:
-        status_card = await target.send(embed=status_embed)
-        if isinstance(target, discord.TextChannel):
-            try:
-                await status_card.pin()
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning(f"Could not post initial status card: {e}")
 
     while True:
         await asyncio.sleep(6)
@@ -191,14 +168,6 @@ async def poll_session_activities(session_id: str, target: discord.abc.Messageab
                             )
                             pr_embed.add_field(name="GitHub URL", value=f"[Open Pull Request]({pr.get('url')})", inline=False)
                             await target.send(embed=pr_embed)
-
-                            if status_card:
-                                status_embed.color = 0x2ECC71
-                                status_embed.set_field_at(1, name="Status", value="🟢 PR Created", inline=True)
-                                try:
-                                    await status_card.edit(embed=status_embed)
-                                except Exception:
-                                    pass
 
                 act_url = f"{JULES_API_BASE}/sessions/{session_id}/activities?pageSize=50"
                 act_resp = await client.get(act_url, headers=get_jules_headers())
@@ -253,14 +222,6 @@ async def poll_session_activities(session_id: str, target: discord.abc.Messageab
                             view = PlanApprovalView(session_id, target)
                             await target.send(embed=plan_embed, view=view)
 
-                            if status_card:
-                                status_embed.color = 0xF1C40F
-                                status_embed.set_field_at(1, name="Status", value="🟡 Awaiting Plan Approval", inline=True)
-                                try:
-                                    await status_card.edit(embed=status_embed)
-                                except Exception:
-                                    pass
-
                         elif "progressUpdated" in act:
                             p = act["progressUpdated"]
                             title_step = p.get("title", "")
@@ -273,25 +234,9 @@ async def poll_session_activities(session_id: str, target: discord.abc.Messageab
                                     await target.send(f"⚡ _{title_step}_")
                                 
                                 last_progress_text = curr_text
-                                if status_card:
-                                    status_embed.description = f"**Current Step:** {title_step}\n_{desc_step}_"
-                                    status_embed.color = 0x3498DB
-                                    status_embed.set_field_at(1, name="Status", value="⚡ Working...", inline=True)
-                                    status_embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
-                                    try:
-                                        await status_card.edit(embed=status_embed)
-                                    except Exception:
-                                        pass
 
                         elif "sessionCompleted" in act:
-                            if status_card:
-                                status_embed.description = " Task completed successfully!"
-                                status_embed.color = 0x2ECC71
-                                status_embed.set_field_at(1, name="Status", value="🟢 Completed", inline=True)
-                                try:
-                                    await status_card.edit(embed=status_embed)
-                                except Exception:
-                                    pass
+                            await target.send("🟢 **Session Completed**")
                             return
 
                         elif "sessionFailed" in act:
@@ -302,14 +247,7 @@ async def poll_session_activities(session_id: str, target: discord.abc.Messageab
                                 color=0xE74C3C,
                             )
                             await target.send(embed=fail_embed)
-                            if status_card:
-                                status_embed.description = f"❌ Execution failed: {reason}"
-                                status_embed.color = 0xE74C3C
-                                status_embed.set_field_at(1, name="Status", value="🔴 Failed", inline=True)
-                                try:
-                                    await status_card.edit(embed=status_embed)
-                                except Exception:
-                                    pass
+
                             return
 
                 consecutive_errors = 0
