@@ -129,9 +129,22 @@ class PlanApprovalView(discord.ui.View):
 
 async def poll_session_activities(session_id: str, target: discord.abc.Messageable, prompt: str = ""):
     """Polls Jules session and populates target channel/thread with live updates."""
+    # First, check if the session is already finished so we don't spam the channel on restart
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            act_url = f"{JULES_API_BASE}/sessions/{session_id}/activities?pageSize=50"
+            act_resp = await client.get(act_url, headers=get_jules_headers())
+            if act_resp.status_code == 200:
+                for act in act_resp.json().get("activities", []):
+                    if "sessionCompleted" in act or "sessionFailed" in act:
+                        return  # Session is already done, exit silently
+        except Exception as e:
+            logger.warning(f"Failed initial check for {session_id}: {e}")
+
     seen_activity_ids = set()
     consecutive_errors = 0
     last_progress_text = ""
+    last_progress_title = ""
 
     status_embed = discord.Embed(
         title="🤖 Jules Session Status",
@@ -214,23 +227,14 @@ async def poll_session_activities(session_id: str, target: discord.abc.Messageab
                         seen_activity_ids.add(aid)
 
                         if "userMessaged" in act:
-                            u_msg = act["userMessaged"].get("userMessage", "")
-                            if u_msg:
-                                u_embed = discord.Embed(
-                                    description=f"💬 **User:** {u_msg[:1900]}",
-                                    color=0x95A5A6,
-                                )
-                                await target.send(embed=u_embed)
+                            # Ignore user messages to prevent echoing them back and cluttering the chat
+                            pass
 
                         elif "agentMessaged" in act:
                             msg = act["agentMessaged"].get("agentMessage", "")
                             if msg:
-                                a_embed = discord.Embed(
-                                    title="🤖 Jules",
-                                    description=msg[:1900],
-                                    color=0x9B59B6,
-                                )
-                                await target.send(embed=a_embed)
+                                # Send as plain text for native chat feel on mobile
+                                await target.send(f"🤖 **Jules:**\n{msg[:1900]}")
 
                         elif "planGenerated" in act:
                             plan_data = act["planGenerated"].get("plan", {})
@@ -263,6 +267,11 @@ async def poll_session_activities(session_id: str, target: discord.abc.Messageab
                             desc_step = p.get("description", "")
                             curr_text = f"{title_step}: {desc_step}"
                             if curr_text != last_progress_text:
+                                # If the main step title changed, send a quick inline chat update for mobile visibility
+                                if title_step and title_step != last_progress_title:
+                                    last_progress_title = title_step
+                                    await target.send(f"⚡ _{title_step}_")
+                                
                                 last_progress_text = curr_text
                                 if status_card:
                                     status_embed.description = f"**Current Step:** {title_step}\n_{desc_step}_"
